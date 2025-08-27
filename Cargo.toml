@@ -1,0 +1,12 @@
+[package]
+name = "mzspeclib-rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mzspeclib"
+
+[dependencies]
+mzdata = "0.56.0"
+mzpeaks = "1.0.9"
+thiserror = "2.0.16"
