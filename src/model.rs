@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::fmt::Display;
 
 use mzdata::curie;
-use mzdata::params::Value;
+use mzdata::params::{ParamValue, Value};
 
 use mzpeaks::{MZPeakSetType, prelude::*};
 
 use crate::attr::{Attribute, AttributeValue, Attributed, AttributedMut, Term, impl_attributed};
+use crate::mzpaf::PeakAnnotation;
 use crate::{AttributeSet, EntryType};
 
 #[derive(Debug, Clone, Default)]
@@ -52,12 +53,12 @@ pub struct AnnotatedPeak {
     pub mz: f64,
     pub intensity: f32,
     pub index: mzpeaks::IndexType,
-    pub annotations: String,
+    pub annotations: Vec<PeakAnnotation>,
     pub aggregations: String,
 }
 
 impl AnnotatedPeak {
-    pub fn new(mz: f64, intensity: f32, index: mzpeaks::IndexType, annotations: String, aggregations: String) -> Self {
+    pub fn new(mz: f64, intensity: f32, index: mzpeaks::IndexType, annotations: Vec<PeakAnnotation>, aggregations: String) -> Self {
         Self { mz, intensity, index, annotations, aggregations }
     }
 }
@@ -70,25 +71,17 @@ impl Display for AnnotatedPeak {
 
         if !self.annotations.is_empty() {
             f.write_str("\t")?;
-            write!(f, "{}", self.annotations)?;
-            // let n = self.annotations.len();
-            // for (i, annot) in self.annotations.iter().enumerate() {
-            //     write!(f, "{annot}")?;
-            //     if i < n - 1 {
-            //         f.write_str(",")?;
-            //     }
-            // }
+            for (i, a) in self.annotations.iter().enumerate() {
+                if i == 0 {
+                    write!(f, "{a}")?;
+                } else {
+                    write!(f, ",{a}")?;
+                }
+            }
         }
         if !self.aggregations.is_empty() {
             f.write_str("\t")?;
             write!(f, "{}", self.aggregations)?;
-            // let n = self.aggregations.len();
-            // for (i, aggr) in self.aggregations.iter().enumerate() {
-            //     write!(f, "{aggr}")?;
-            //     if i < n - 1 {
-            //         f.write_str(",")?;
-            //     }
-            // }
         }
         Ok(())
     }
@@ -214,6 +207,11 @@ impl LibrarySpectrum {
             interpretations,
             peaks,
         }
+    }
+
+    pub fn scan_number(&self) -> Option<usize> {
+        let (_, v) = self.find_by_id(curie!(MS:1003057))?;
+        v.value.scalar().to_i64().ok().map(|v| v as usize)
     }
 }
 
