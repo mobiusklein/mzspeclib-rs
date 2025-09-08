@@ -1,24 +1,20 @@
-#![allow(unused_imports)]
-
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::io::{self, prelude::*};
 
 use indexmap::IndexMap;
-use mzdata::curie;
-use mzdata::io::OffsetIndex;
-use mzdata::params::{CURIE, CURIEParsingError, ControlledVocabulary, ParamValue};
+use mzdata::params::{CURIE, ControlledVocabulary, ParamValue};
 use mzpeaks::prelude::PeakCollectionMut;
 
 use crate::model::{
-    Analyte, AnnotatedPeak, IdType, Interpretation, InterpretationMember, LibraryHeader,
+    Analyte, AnnotatedPeak, IdType, Interpretation, LibraryHeader,
     LibrarySpectrum,
 };
 
-use crate::{mzpaf, Term};
+use crate::{mzpaf, Attributed, Term};
 use crate::attr::{
-    Attribute, AttributeParseError, AttributeSet, AttributeValue, AttributeValueParseError,
-    Attributed, AttributedMut, EntryType, TermParserError,
+    Attribute, AttributeParseError, AttributeSet, AttributeValueParseError,
+    AttributedMut, EntryType,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -349,6 +345,28 @@ impl<R: Read> MzSpecLibParser<R> {
                 }
             }
         }
+
+        let mut next_group_id = analyte.find_last_group_id().unwrap_or_default();
+        let mut last_group_id = 0;
+
+        let attr_set_name = Term::new(mzdata::curie!(MS:1003212), "library attribute set name".into());
+        let attr_sets: Vec<_> = analyte.find_all(&attr_set_name).map(|v| v.value.to_string()).collect();
+        for name in attr_sets {
+            for attr_set in self.header.attribute_classes.get(&EntryType::Analyte).into_iter().flatten() {
+                if attr_set.id == name || attr_set.id == "all" {
+                    for mut attr in attr_set.attributes.iter().cloned() {
+                        if let Some(gi) = attr.group_id {
+                            if gi != last_group_id {
+                                next_group_id += 1;
+                                last_group_id = gi;
+                            }
+                            attr.group_id = Some(next_group_id);
+                        }
+                        analyte.add_attribute(attr);
+                    }
+                }
+            }
+        }
         Ok(analyte)
     }
 
@@ -380,6 +398,28 @@ impl<R: Read> MzSpecLibParser<R> {
                 }
             }
         }
+
+        let mut next_group_id = interp.find_last_group_id().unwrap_or_default();
+        let mut last_group_id = 0;
+
+        let attr_set_name = Term::new(mzdata::curie!(MS:1003212), "library attribute set name".into());
+        let attr_sets: Vec<_> = interp.find_all(&attr_set_name).map(|v| v.value.to_string()).collect();
+        for name in attr_sets {
+            for attr_set in self.header.attribute_classes.get(&EntryType::Interpretation).into_iter().flatten() {
+                if attr_set.id == name || attr_set.id == "all" {
+                    for mut attr in attr_set.attributes.iter().cloned() {
+                        if let Some(gi) = attr.group_id {
+                            if gi != last_group_id {
+                                next_group_id += 1;
+                                last_group_id = gi;
+                            }
+                            attr.group_id = Some(next_group_id);
+                        }
+                        interp.add_attribute(attr);
+                    }
+                }
+            }
+        }
         Ok(interp)
     }
 
@@ -407,7 +447,7 @@ impl<R: Read> MzSpecLibParser<R> {
             }
         };
 
-        let mut peak = AnnotatedPeak::new(mz, intensity, 0, Vec::new(), String::new());
+        let mut peak = AnnotatedPeak::new(mz, intensity, 0, Vec::new(), Vec::new());
 
         match it.next() {
             Some(v) => {
@@ -419,7 +459,7 @@ impl<R: Read> MzSpecLibParser<R> {
 
         match it.next() {
             Some(v) => {
-                peak.aggregations = v.to_string();
+                peak.aggregations = v.split(",").map(|i| i.to_string()).collect();
             },
             None => return Ok(peak)
         }
@@ -490,6 +530,28 @@ impl<R: Read> MzSpecLibParser<R> {
             }
         }
 
+        let mut next_group_id = spec.find_last_group_id().unwrap_or_default();
+        let mut last_group_id = 0;
+
+        let attr_set_name = Term::new(mzdata::curie!(MS:1003212), "library attribute set name".into());
+        let attr_sets: Vec<_> = spec.find_all(&attr_set_name).map(|v| v.value.to_string()).collect();
+        for name in attr_sets {
+            for attr_set in self.header.attribute_classes.get(&EntryType::Spectrum).into_iter().flatten() {
+                if attr_set.id == name || attr_set.id == "all" {
+                    for mut attr in attr_set.attributes.iter().cloned() {
+                        if let Some(gi) = attr.group_id {
+                            if gi != last_group_id {
+                                next_group_id += 1;
+                                last_group_id = gi;
+                            }
+                            attr.group_id = Some(next_group_id);
+                        }
+                        spec.add_attribute(attr);
+                    }
+                }
+            }
+        }
+
         if matches!(self.state, ParserState::Peaks) {
             loop {
                 let z = self.read_next_line(&mut buf)?;
@@ -510,7 +572,6 @@ impl<R: Read> MzSpecLibParser<R> {
                 spec.peaks.push(peak);
             }
         }
-
         Ok(spec)
     }
 
@@ -520,6 +581,10 @@ impl<R: Read> MzSpecLibParser<R> {
 
     pub fn inner(&self) -> &io::BufReader<R> {
         &self.inner
+    }
+
+    pub fn as_mut(&mut self) -> &mut io::BufReader<R> {
+        &mut self.inner
     }
 
     pub fn into_inner(self) -> io::BufReader<R> {
@@ -696,6 +761,8 @@ impl<R: io::Read + io::Seek> MzSpecLibParser<R> {
 #[cfg(test)]
 mod test {
     use std::fs;
+
+    use crate::Attributed;
 
     use super::*;
 

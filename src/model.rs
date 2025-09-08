@@ -2,19 +2,31 @@ use std::collections::HashMap;
 use std::fmt::Display;
 
 use mzdata::curie;
-use mzdata::params::{ParamValue, Value};
+use mzdata::params::{ParamDescribed, ParamLike, ParamValue, Unit, Value, ValueRef};
 
+use mzdata::prelude::{IonProperties, PrecursorSelection, SpectrumLike};
+use mzdata::spectrum::SignalContinuity;
 use mzpeaks::{MZPeakSetType, prelude::*};
 
 use crate::attr::{Attribute, AttributeValue, Attributed, AttributedMut, Term, impl_attributed};
 use crate::mzpaf::PeakAnnotation;
-use crate::{AttributeSet, EntryType};
+use crate::{AttributeSet, EntryType, term};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LibraryHeader {
     pub format_version: String,
     pub attributes: Vec<Attribute>,
     pub attribute_classes: HashMap<EntryType, Vec<AttributeSet>>,
+}
+
+impl Default for LibraryHeader {
+    fn default() -> Self {
+        Self {
+            format_version: "1.0".into(),
+            attributes: Default::default(),
+            attribute_classes: Default::default(),
+        }
+    }
 }
 
 impl_attributed!(mut LibraryHeader);
@@ -54,12 +66,24 @@ pub struct AnnotatedPeak {
     pub intensity: f32,
     pub index: mzpeaks::IndexType,
     pub annotations: Vec<PeakAnnotation>,
-    pub aggregations: String,
+    pub aggregations: Vec<String>,
 }
 
 impl AnnotatedPeak {
-    pub fn new(mz: f64, intensity: f32, index: mzpeaks::IndexType, annotations: Vec<PeakAnnotation>, aggregations: String) -> Self {
-        Self { mz, intensity, index, annotations, aggregations }
+    pub fn new(
+        mz: f64,
+        intensity: f32,
+        index: mzpeaks::IndexType,
+        annotations: Vec<PeakAnnotation>,
+        aggregations: Vec<String>,
+    ) -> Self {
+        Self {
+            mz,
+            intensity,
+            index,
+            annotations,
+            aggregations,
+        }
     }
 }
 
@@ -81,7 +105,7 @@ impl Display for AnnotatedPeak {
         }
         if !self.aggregations.is_empty() {
             f.write_str("\t")?;
-            write!(f, "{}", self.aggregations)?;
+            write!(f, "{}", self.aggregations.join(","))?;
         }
         Ok(())
     }
@@ -122,8 +146,18 @@ pub struct Interpretation {
 }
 
 impl Interpretation {
-    pub fn new(id: IdType, attributes: Vec<Attribute>, analyte_refs: Vec<IdType>, members: Vec<InterpretationMember>) -> Self {
-        Self { id, attributes, analyte_refs, members }
+    pub fn new(
+        id: IdType,
+        attributes: Vec<Attribute>,
+        analyte_refs: Vec<IdType>,
+        members: Vec<InterpretationMember>,
+    ) -> Self {
+        Self {
+            id,
+            attributes,
+            analyte_refs,
+            members,
+        }
     }
 }
 
@@ -213,6 +247,36 @@ impl LibrarySpectrum {
         let (_, v) = self.find_by_id(curie!(MS:1003057))?;
         v.value.scalar().to_i64().ok().map(|v| v as usize)
     }
+
+    pub fn analyte(&self, id: IdType) -> Option<&Analyte> {
+        self.analytes.iter().find(|v| v.id == id)
+    }
+
+    pub fn add_analyte(&mut self, mut analyte: Analyte) {
+        let k = (self.analytes.len() + 1) as u32;
+        analyte.id = k;
+        self.analytes.push(analyte);
+    }
+
+    pub fn remove_analyte(&mut self, id: IdType) -> Option<Analyte> {
+        let i = self.analytes.iter().position(|v| v.id == id)?;
+        Some(self.analytes.remove(i))
+    }
+
+    pub fn interpretation(&self, id: IdType) -> Option<&Interpretation> {
+        self.interpretations.iter().find(|v| v.id == id)
+    }
+
+    pub fn add_interpretation(&mut self, mut interpretation: Interpretation) {
+        let k = (self.interpretations.len() + 1) as u32;
+        interpretation.id = k;
+        self.interpretations.push(interpretation);
+    }
+
+    pub fn remove_interpretation(&mut self, id: IdType) -> Option<Interpretation> {
+        let i = self.interpretations.iter().position(|v| v.id == id)?;
+        Some(self.interpretations.remove(i))
+    }
 }
 
 impl Display for LibrarySpectrum {
@@ -233,5 +297,158 @@ impl Display for LibrarySpectrum {
             writeln!(f, "{p}")?;
         }
         Ok(())
+    }
+}
+
+impl From<mzdata::Spectrum> for LibrarySpectrum {
+    fn from(value: mzdata::Spectrum) -> Self {
+        let mut this = Self::default();
+        this.key = (value.index() + 1) as IdType;
+        this.index = value.index();
+        this.name = value
+            .description()
+            .title()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| value.id().to_string())
+            .into_boxed_str();
+
+        let mut group_id = this.find_last_group_id().unwrap_or_default() + 1;
+
+        macro_rules! handle_param {
+            ($param:expr) => {
+                if matches!($param.value(), ValueRef::Empty) {
+                    todo!(
+                        "Don't know how to convert value-less params yet: {:?}",
+                        $param
+                    )
+                } else {
+                    if $param.is_controlled() {
+                        if matches!($param.unit, Unit::Unknown) {
+                            this.add_attribute(Attribute::new(
+                                Term::new(
+                                    $param.curie().unwrap(),
+                                    $param.name.clone().into_boxed_str(),
+                                ),
+                                $param.value.clone(),
+                                None,
+                            ))
+                        } else {
+                            this.add_attribute(Attribute::new(
+                                Term::new(
+                                    $param.curie().unwrap(),
+                                    $param.name.clone().into_boxed_str(),
+                                ),
+                                $param.value.clone(),
+                                Some(group_id),
+                            ));
+                            this.add_attribute(
+                                Attribute::unit($param.unit, Some(group_id)).unwrap(),
+                            );
+                            group_id += 1;
+                        }
+                    } else {
+                        this.add_attribute(
+                            Attribute::new(
+                                term!(MS:1003275|"other attribute name"),
+                                Value::String($param.name().to_string()),
+                                Some(group_id)
+                            )
+                        );
+                        this.add_attribute(
+                            Attribute::new(
+                                term!(MS:1003276|"other attribute value"),
+                                $param.value.clone(),
+                                Some(group_id)
+                            )
+                        );
+                        group_id += 1;
+                    }
+                }
+            };
+        }
+
+        for scan in value.acquisition().iter() {
+            if let Some(filter_string) = scan.filter_string() {
+                let attr = Attribute::new(
+                    term!(MS:1000512|"filter string"),
+                    Value::String(filter_string.to_string()),
+                    None,
+                );
+                this.add_attribute(attr);
+            }
+
+            let attr = Attribute::new(
+                term!(MS:1000016|"scan start time"),
+                Value::Float(scan.start_time),
+                Some(group_id),
+            );
+            let unit = Attribute::unit(Unit::Minute, Some(group_id)).unwrap();
+            this.add_attribute(attr);
+            this.add_attribute(unit);
+            group_id += 1;
+
+            if scan.injection_time != 0.0 {
+                this.add_attribute_with_unit(
+                    Attribute::new(
+                        term!(MS:1000927|"ion injection time"),
+                        Value::Float(scan.injection_time as f64),
+                        Some(group_id),
+                    ),
+                    Unit::Millisecond,
+                    Some(group_id),
+                );
+                group_id += 1;
+            }
+
+            for param in scan.params() {
+                handle_param!(param);
+            }
+        }
+        if let Some(precursor) = value.precursor() {
+            let ion = precursor.ion();
+            this.add_attribute(Attribute::new(
+                term!(MS:1000744|"selected ion m/z"),
+                Value::Float(ion.mz()),
+                Some(group_id),
+            ));
+            this.add_attribute(Attribute::unit(Unit::MZ, Some(group_id)).unwrap());
+            group_id += 1;
+            if let Some(z) = ion.charge() {
+                this.add_attribute(Attribute::new(
+                    term!(MS:1000041|"charge state"),
+                    Value::Int(z as i64),
+                    None,
+                ));
+            }
+            this.add_attribute(Attribute::new(
+                term!(MS:1000042|"peak intensity"),
+                Value::Float(ion.intensity as f64),
+                Some(group_id),
+            ));
+            this.add_attribute(Attribute::unit(Unit::MZ, Some(group_id)).unwrap());
+            group_id += 1;
+
+            for param in ion.params() {
+                handle_param!(param);
+            }
+        }
+
+        if value.signal_continuity() == SignalContinuity::Centroid {
+            this.peaks = value
+                .peaks()
+                .iter()
+                .map(|v| {
+                    AnnotatedPeak::new(
+                        v.mz(),
+                        v.intensity(),
+                        0,
+                        Default::default(),
+                        Default::default(),
+                    )
+                })
+                .collect();
+        }
+
+        this
     }
 }

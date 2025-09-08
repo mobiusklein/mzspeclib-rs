@@ -1,26 +1,25 @@
-#![allow(unused)]
-
 use super::{
-    IonType, Isotope,  Adduct, NeutralLoss, PeakAnnotation,
-    PeptideBackboneIonSeries, Tolerance, FormulaComponent, SignedFormulaComponent,
+    Adduct, FormulaComponent, IonType, Isotope, NeutralLoss, PeakAnnotation,
+    PeptideBackboneIonSeries, SignedFormulaComponent, Tolerance,
 };
 
 use nom;
 use nom::branch::alt;
-use nom::bytes::complete::{tag_no_case, take_until};
-use nom::bytes::tag;
-use nom::number::complete::recognize_float_or_exceptions;
-use nom::combinator::{all_consuming, cond, opt, recognize};
+use nom::bytes::complete::tag_no_case;
+use nom::combinator::{all_consuming, cond, opt};
 use nom::error::{context, ParseError};
+use nom_language::error::{VerboseError, VerboseErrorKind};
 use nom::multi::{many0, many1, separated_list0};
-use nom::sequence::preceded;
+use nom::number::complete::recognize_float_or_exceptions;
 use nom::{
-    IResult, Parser,
+    Parser,
     character::complete::{char, i32 as parse_i32, one_of, usize as parse_usize},
-    sequence::{delimited, terminated},
+    sequence::terminated,
 };
 
-fn read_analyte_reference(line: &str) -> nom::IResult<&str, Option<usize>> {
+pub type IResult<I, O> = nom::IResult<I, O, VerboseError<I>>;
+
+fn read_analyte_reference(line: &str) -> IResult<&str, Option<usize>> {
     if let Ok((line, digits)) =
         terminated(parse_usize::<&str, nom::error::Error<&str>>, char('@')).parse(line)
     {
@@ -30,14 +29,14 @@ fn read_analyte_reference(line: &str) -> nom::IResult<&str, Option<usize>> {
     }
 }
 
-fn read_auxiliary(line: &str) -> nom::IResult<&str, bool> {
+fn read_auxiliary(line: &str) -> IResult<&str, bool> {
     let (is_auxiliary, line) =
         if let Ok((line, _tok)) = char::<&str, nom::error::Error<&str>>('&')(line) {
             (true, line)
         } else {
             (false, line)
         };
-    nom::IResult::Ok((line, is_auxiliary))
+    IResult::Ok((line, is_auxiliary))
 }
 
 const fn nested(
@@ -48,7 +47,11 @@ const fn nested(
         let mut index = 0;
         let mut bracket_counter = 0;
         if !i.starts_with(opening_bracket) {
-            return Err(nom::Err::Error(nom::error::Error { input: i, code: nom::error::ErrorKind::Not }))
+            return Err(nom::Err::Error(
+                VerboseError {
+                    errors: vec![(i, VerboseErrorKind::Nom(nom::error::ErrorKind::Not))]
+                }
+            ))
         }
         while let Some(n) = &i[index..].find(&[opening_bracket, closing_bracket, '\\'][..]) {
             index += n;
@@ -84,15 +87,16 @@ const fn nested(
         if bracket_counter == 0 {
             Ok(("", i))
         } else {
-            Err(nom::Err::Error(nom::error::Error::from_error_kind(
-                i,
-                nom::error::ErrorKind::TakeUntil,
-            )))
+            return Err(nom::Err::Error(
+                VerboseError {
+                    errors: vec![(i, VerboseErrorKind::Nom(nom::error::ErrorKind::TakeUntil))]
+                }
+            ))
         }
     }
 }
 
-fn read_backbone_ion(line: &str) -> nom::IResult<&str, IonType> {
+fn read_backbone_ion(line: &str) -> IResult<&str, IonType> {
     let (line, series) = one_of("abcdwxyz")(line)?;
     let series = match series {
         'a' => PeptideBackboneIonSeries::A,
@@ -123,7 +127,7 @@ fn read_backbone_ion(line: &str) -> nom::IResult<&str, IonType> {
     ))
 }
 
-fn read_internal_ion(line: &str) -> nom::IResult<&str, IonType> {
+fn read_internal_ion(line: &str) -> IResult<&str, IonType> {
     let (line, _) = char('m')(line)?;
     let (line, start) = parse_usize(line)?;
     let (line, _) = char(':')(line)?;
@@ -145,16 +149,18 @@ fn read_internal_ion(line: &str) -> nom::IResult<&str, IonType> {
     ))
 }
 
-fn read_immonium(line: &str) -> nom::IResult<&str, IonType> {
-    let (line, _) = char('I')(line)?;
-    let (line, aa) = one_of("QWERTYUIOPASDFGHJKLMNBVCXZ")(line)?;
+fn read_immonium(line: &str) -> IResult<&str, IonType> {
+    let (line, _) = context("Recognizing the series identifier", char('I')).parse(line)?;
+    let (line, aa) = context(
+        "Recognizing immonium amino acid",
+        one_of("QWERTYUIOPASDFGHJKLMNBVCXZ"),
+    )
+    .parse(line)?;
     if line.starts_with("[") {
-        let (line, rest) = nested('[', ']')(line)?;
+        let (line, rest) = context("Extracting the modification", nested('[', ']')).parse(line)?;
         let ion = IonType::ImmoniumFragment {
             amino_acid: aa,
-            modification: Some(
-                rest[1..rest.len() - 1].to_string().into_boxed_str(),
-            ),
+            modification: Some(rest[1..rest.len() - 1].to_string().into_boxed_str()),
         };
         Ok((line, ion))
     } else {
@@ -174,13 +180,17 @@ fn read_precursor(line: &str) -> IResult<&str, IonType> {
 fn read_reference_ion(line: &str) -> IResult<&str, IonType> {
     let (line, _) = char('r')(line)?;
     let (line, content) = nested('[', ']')(line)?;
-    Ok((line, IonType::ReferenceMolecule(content.to_string().into_boxed_str())))
+    Ok((
+        line,
+        IonType::ReferenceMolecule(content.to_string().into_boxed_str()),
+    ))
 }
 
 fn read_formula_ion_type(line: &str) -> IResult<&str, IonType> {
     let (line, _) = char('f')(line)?;
     let (line, content) = nested('{', '}')(line)?;
-    let (_, formula) = all_consuming(cond(content.len() > 2, parse_formula)).parse(&content[1..content.len() - 1])?;
+    let (_, formula) = all_consuming(cond(content.len() > 2, parse_formula))
+        .parse(&content[1..content.len() - 1])?;
     let formula = formula.unwrap_or_default();
     Ok((line, IonType::Formula(formula)))
 }
@@ -212,18 +222,23 @@ fn read_unannoted_ion(line: &str) -> IResult<&str, IonType> {
     Ok((line, IonType::Unannotated))
 }
 
-fn read_ion_type(line: &str) -> nom::IResult<&str, IonType> {
-    let (line, ion) = alt([
-        read_backbone_ion,
-        read_internal_ion,
-        read_immonium,
-        read_precursor,
-        read_reference_ion,
-        read_formula_ion_type,
-        read_named_ion_type,
-        read_smiles_ion_type,
-        read_unannoted_ion,
-    ]).parse(line)?;
+fn read_ion_type(line: &str) -> IResult<&str, IonType> {
+    let (line, ion) = if let Some(c) = line.chars().next() {
+        match c {
+            '?' => read_unannoted_ion(line),
+            'm' => read_internal_ion(line),
+            'I' => read_immonium(line),
+            'p' => read_precursor(line),
+            'r' => read_reference_ion(line),
+            'f' => read_formula_ion_type(line),
+            '_' => read_named_ion_type(line),
+            's' => read_smiles_ion_type(line),
+            _ => read_backbone_ion(line)
+        }
+    } else {
+        let e = VerboseError::from_error_kind(line, nom::error::ErrorKind::NonEmpty);
+        return Err(nom::Err::Failure(e))
+    }?;
     Ok((line, ion))
 }
 
@@ -235,12 +250,11 @@ fn parse_element_name(line: &str) -> IResult<&str, (Option<i32>, Box<str>)> {
     } else {
         None
     };
-    let ((line, e1)) = one_of::<_, &str, _>("QWERTYUIOPASDFGHKLZXCVBNM").parse(line)?;
-    let ((line, e2)) = opt(one_of::<_, &str, _>("qwertyuiopasdfghklzxcvbnm")).parse(line)?;
+    let (line, e1) = one_of::<_, &str, _>("QWERTYUIOPASDFGHKLZXCVBNM").parse(line)?;
+    let (line, e2) = opt(one_of::<_, &str, _>("qwertyuiopasdfghklzxcvbnm")).parse(line)?;
     let (line, element) = if let Some(e2) = e2 {
-        let ((line, e3)) = opt(one_of::<_, &str, _>("qwertyuiopasdfghklzxcvbnm")).parse(line)?;
+        let (line, e3) = opt(one_of::<_, &str, _>("qwertyuiopasdfghklzxcvbnm")).parse(line)?;
         let elt = if let Some(e3) = e3 {
-
             format!("{e1}{e2}{e3}").into_boxed_str()
         } else {
             format!("{e1}{e2}").into_boxed_str()
@@ -263,7 +277,7 @@ fn parse_element(line: &str) -> IResult<&str, FormulaComponent> {
     let this = FormulaComponent {
         isotope,
         element,
-        count
+        count,
     };
 
     Ok((line, this))
@@ -276,17 +290,36 @@ fn parse_formula(line: &str) -> IResult<&str, Vec<FormulaComponent>> {
 fn parse_signed_formula_component(line: &str) -> IResult<&str, SignedFormulaComponent> {
     let (line, coefficient) = opt(parse_signed).parse(line)?;
     let (line, elt) = parse_element(line)?;
-    Ok((line, SignedFormulaComponent { coefficient: coefficient.unwrap_or(1), component: elt }))
+    Ok((
+        line,
+        SignedFormulaComponent {
+            coefficient: coefficient.unwrap_or(1),
+            component: elt,
+        },
+    ))
 }
 
 fn read_neutral_loss(line: &str) -> IResult<&str, NeutralLoss> {
     let (line, coef) = parse_signed(line)?;
     if line.starts_with('[') {
-        let (line, refname) = context("neutral loss reference name", nested('[', ']')).parse(line)?;
-        Ok((line, NeutralLoss::ReferenceMolecule { coefficient: coef, name: refname.to_string().into_boxed_str() }))
+        let (line, refname) =
+            context("neutral loss reference name", nested('[', ']')).parse(line)?;
+        Ok((
+            line,
+            NeutralLoss::ReferenceMolecule {
+                coefficient: coef,
+                name: refname.to_string().into_boxed_str(),
+            },
+        ))
     } else {
         let (line, formula) = context("neutral loss formula", parse_formula).parse(line)?;
-        Ok((line, NeutralLoss::Formula { coefficient: coef, formula }))
+        Ok((
+            line,
+            NeutralLoss::Formula {
+                coefficient: coef,
+                formula,
+            },
+        ))
     }
 }
 
@@ -295,7 +328,11 @@ fn read_neutral_loss_list(line: &str) -> IResult<&str, Vec<NeutralLoss>> {
 }
 
 fn parse_signed(line: &str) -> IResult<&str, i32> {
-    alt((parse_i32, one_of("+-").map(|v| if v == '+' { 1 } else { -1 }))).parse(line)
+    alt((
+        parse_i32,
+        one_of("+-").map(|v| if v == '+' { 1 } else { -1 }),
+    ))
+    .parse(line)
 }
 
 fn parse_isotope_element(line: &str) -> IResult<&str, (i32, Box<str>)> {
@@ -308,7 +345,14 @@ fn read_isotope(line: &str) -> IResult<&str, Isotope> {
     let (line, coefficient) = parse_signed.parse(line)?;
     let (line, _) = char('i')(line)?;
     if let Ok((line, (nucleon_count, element))) = parse_isotope_element(line) {
-        Ok((line, Isotope::Element { coefficient, nucleon_count, element }))
+        Ok((
+            line,
+            Isotope::Element {
+                coefficient,
+                nucleon_count,
+                element,
+            },
+        ))
     } else if let Ok((line, _)) = char::<_, nom::error::Error<&str>>('A')(line) {
         Ok((line, Isotope::Averaged { coefficient }))
     } else {
@@ -317,9 +361,9 @@ fn read_isotope(line: &str) -> IResult<&str, Isotope> {
 }
 
 fn read_adduct(line: &str) -> IResult<&str, Adduct> {
-    let (line, content)  = context("adduct", nested('[', ']')).parse(&line)?;
+    let (line, content) = context("adduct", nested('[', ']')).parse(&line)?;
     if content.is_empty() {
-        return Ok((line, Adduct(Vec::new())))
+        return Ok((line, Adduct(Vec::new())));
     }
     let line = &content[1..content.len().saturating_sub(1)];
 
@@ -345,7 +389,6 @@ fn read_mass_error(line: &str) -> IResult<&str, Tolerance> {
     } else {
         Ok((line, Tolerance::Da(deviation)))
     }
-
 }
 
 fn read_confidence(line: &str) -> IResult<&str, f64> {
@@ -355,19 +398,21 @@ fn read_confidence(line: &str) -> IResult<&str, f64> {
     Ok((rest, conf))
 }
 
-pub fn parse_annotation_line_once(line: &str) -> nom::IResult<&str, PeakAnnotation> {
-    let (line, is_auxiliary) = read_auxiliary(line)?;
-    let (line, analyte_number) = read_analyte_reference(line)?;
-    let (line, ion) = read_ion_type(line)?;
-    let (line, neutral_losses) = read_neutral_loss_list(line)?;
-    let (line, isotopes) = many0(read_isotope).parse(line)?;
-    let (line, adduct) = opt(read_adduct).parse(line)?;
-    let (line, charge) = if line.is_empty() { (line, Some(1)) } else { opt(read_charge).parse(line)? };
+pub fn parse_annotation_line_once(line: &str) -> IResult<&str, PeakAnnotation> {
+    let (line, is_auxiliary) = context("parsing auxiliary marker", read_auxiliary).parse(line)?;
+    let (line, analyte_number) = context("parsing analyte reference", read_analyte_reference).parse(line)?;
+    let (line, ion) = context("parsing ion type", read_ion_type).parse(line)?;
+    let (line, neutral_losses) = context("parsing neutral losses",read_neutral_loss_list).parse(line)?;
+    let (line, isotopes) = context("parsing isotopes", many0(read_isotope)).parse(line)?;
+    let (line, adduct) = context("parsing adduct", opt(read_adduct)).parse(line)?;
+    let (line, charge) = if line.is_empty() {
+        (line, Some(1))
+    } else {
+        context("parsing charge state", opt(read_charge)).parse(line)?
+    };
 
-
-    let (line, deviation) = opt(read_mass_error).parse(line)?;
-    let (line, confidence) = opt(read_confidence).parse(line)?;
-
+    let (line, deviation) = context("parsing mass error", opt(read_mass_error)).parse(line)?;
+    let (line, confidence) = context("parsing confidence", opt(read_confidence)).parse(line)?;
 
     Ok((
         line,
@@ -385,11 +430,9 @@ pub fn parse_annotation_line_once(line: &str) -> nom::IResult<&str, PeakAnnotati
     ))
 }
 
-
 pub fn parse_annotation_line(line: &str) -> IResult<&str, Vec<PeakAnnotation>> {
     all_consuming(separated_list0(char(','), parse_annotation_line_once)).parse(line)
 }
-
 
 #[cfg(test)]
 mod test {
@@ -397,17 +440,32 @@ mod test {
 
     #[test]
     fn test_nested() {
-        let (rest, part) = nested('[', ']')("[foobar]baz").unwrap();
+        let (_, part) = nested('[', ']')("[foobar]baz").unwrap();
         assert_eq!(part, "[foobar]");
 
-        let (rest, part) = nested('[', ']')("[foo[bar]]baz").unwrap();
+        let (_, part) = nested('[', ']')("[foo[bar]]baz").unwrap();
         assert_eq!(part, "[foo[bar]]");
     }
 
     #[test]
     fn test_loss() {
         let (_, loss) = read_neutral_loss("-H2O").unwrap();
-        eprintln!("{loss:?}");
+        let x = NeutralLoss::Formula {
+            coefficient: -1,
+            formula: vec![
+                FormulaComponent {
+                    count: 2,
+                    isotope: None,
+                    element: Box::from("H"),
+                },
+                FormulaComponent {
+                    count: 1,
+                    isotope: None,
+                    element: Box::from("O"),
+                },
+            ],
+        };
+        assert_eq!(loss, x);
     }
 
     #[test]
@@ -425,8 +483,16 @@ mod test {
     }
 
     #[test]
-    fn test_a() {
-        let (line, ions) = parse_annotation_line("b4+i/4.8ppm,y5/5ppm*0.99").unwrap();
+    fn test_comma_separated_list() {
+        let (_, ions) = parse_annotation_line("b4+i/4.8ppm,y5/5ppm*0.99").unwrap();
         eprintln!("{ions:?}")
+    }
+
+    #[test]
+    fn test_immonium() {
+        let (_, ion) = parse_annotation_line_once("IA").unwrap();
+        eprintln!("{ion:?}");
+        let err = parse_annotation_line_once("I?/5ppm").unwrap_err();
+        eprintln!("{err}")
     }
 }

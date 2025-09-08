@@ -1,6 +1,7 @@
 mod attr;
 mod model;
 mod parse;
+mod write;
 
 pub mod mzpaf;
 
@@ -11,4 +12,5 @@ pub use model::{
     LibrarySpectrum,
 };
 
-pub use parse::MzSpecLibParser;
+pub use parse::{MzSpecLibParser, LibraryIndex, LibraryIndexRecord};
+pub use write::MzSpecLibTextWriter;

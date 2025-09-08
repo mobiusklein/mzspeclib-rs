@@ -2,7 +2,7 @@ use std::{borrow::Cow, fmt::Display, str::FromStr};
 
 use mzdata::{
     curie,
-    params::{CURIE, CURIEParsingError, ParamValue, ParamValueParseError, Value},
+    params::{CURIE, CURIEParsingError, ParamValue, ParamValueParseError, Unit, Value},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +21,31 @@ pub enum TermParserError {
 pub struct Term {
     pub accession: CURIE,
     pub name: Box<str>,
+}
+
+impl PartialOrd for Term {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(&other))
+    }
+}
+
+impl Ord for Term {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.accession == other.accession {
+            return std::cmp::Ordering::Equal;
+        }
+        self.name.cmp(&other.name)
+    }
+}
+
+#[macro_export]
+macro_rules! term {
+    ($ns:ident:$accession:literal|$name:literal) => {
+        $crate::Term::new(
+            mzdata::curie!($ns:$accession),
+            $name.to_string().into_boxed_str()
+        )
+    };
 }
 
 impl FromStr for Term {
@@ -73,6 +98,10 @@ impl AttributeValue {
             AttributeValue::List(_) => Cow::Owned(Value::String(self.to_string())),
             AttributeValue::Term(term) => Cow::Owned(Value::String(term.to_string())),
         }
+    }
+
+    pub fn from_scalar(value: impl Into<Value>) -> Self {
+        Self::Scalar(value.into())
     }
 }
 
@@ -197,12 +226,22 @@ impl FromStr for Attribute {
 }
 
 impl Attribute {
-    pub fn new(name: Term, value: AttributeValue, group_id: Option<u32>) -> Self {
+    pub fn new(name: Term, value: impl Into<AttributeValue>, group_id: Option<u32>) -> Self {
         Self {
             name,
-            value,
+            value: value.into(),
             group_id,
         }
+    }
+
+    pub fn unit(unit: Unit, group_id: Option<u32>) -> Option<Self> {
+        let (_, name) = unit.for_param();
+        let accession = unit.to_curie()?;
+        Some(Attribute::new(
+            term!(UO:0000000|"unit"),
+            Term::new(accession, name.to_string().into_boxed_str()),
+            group_id,
+        ))
     }
 }
 
@@ -284,6 +323,25 @@ pub trait Attributed {
             }
         })
     }
+
+    fn iter_attribute_groups(&self) -> impl Iterator<Item = Vec<&Attribute>> {
+        let last_group_id = self.find_last_group_id().unwrap_or_default();
+        (0..=last_group_id).map(|v| self.find_group(v))
+    }
+
+    fn find_last_group_id(&self) -> Option<u32> {
+        self.attributes()
+            .iter()
+            .map(|v| v.group_id)
+            .reduce(|prev, new| match new {
+                Some(new) => match prev {
+                    Some(prev) => Some(prev.max(new)),
+                    None => Some(new),
+                },
+                None => prev,
+            })
+            .unwrap_or_default()
+    }
 }
 
 pub trait AttributedMut: Attributed {
@@ -303,6 +361,16 @@ pub trait AttributedMut: Attributed {
         for attr in attrs {
             self.add_attribute(attr);
         }
+    }
+
+    fn add_attribute_with_unit(&mut self, mut attr: Attribute, unit: Unit, group_id: Option<u32>) -> Option<u32> {
+        let group_id = Some(group_id.unwrap_or_else(|| self.find_last_group_id().unwrap_or_default() + 1));
+        attr.group_id = group_id;
+        self.add_attribute(attr);
+        if let Some(attr) = Attribute::unit(unit, group_id) {
+            self.add_attribute(attr);
+        }
+        group_id
     }
 }
 
@@ -367,7 +435,11 @@ impl_attributed!(mut AttributeSet);
 
 impl AttributeSet {
     pub fn new(id: String, namespace: EntryType, attributes: Vec<Attribute>) -> Self {
-        Self { id, namespace, attributes }
+        Self {
+            id,
+            namespace,
+            attributes,
+        }
     }
 }
 
